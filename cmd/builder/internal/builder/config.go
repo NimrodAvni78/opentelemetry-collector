@@ -4,8 +4,11 @@
 package builder // import "go.opentelemetry.io/collector/cmd/builder/internal/builder"
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -55,7 +58,19 @@ type Config struct {
 
 	ConfResolver ConfResolver `mapstructure:"conf_resolver,omitempty"`
 
+	// DownloadCacheDir overrides the root directory used to cache downloaded
+	// source archives. When empty, a default under os.UserCacheDir() is used.
+	DownloadCacheDir string `mapstructure:"download_cache_dir,omitempty"`
+
 	downloadModules retry `mapstructure:"-"`
+
+	// sourceArchiveCacheRoot overrides the resolved source archive cache root.
+	// It is only set in tests to avoid writing to the real user cache dir.
+	sourceArchiveCacheRoot string `mapstructure:"-"`
+
+	// httpClient is the HTTP client used to download source archives. When nil,
+	// a default client with a sane timeout is used. It is only set in tests.
+	httpClient *http.Client `mapstructure:"-"`
 }
 
 type ConfResolver struct {
@@ -81,10 +96,26 @@ type Distribution struct {
 
 // Module represents a receiver, exporter, processor or extension for the distribution
 type Module struct {
-	Name   string `mapstructure:"name,omitempty"`   // if not specified, this is package part of the go mod (last part of the path)
-	Import string `mapstructure:"import,omitempty"` // if not specified, this is the path part of the go mods
-	GoMod  string `mapstructure:"gomod,omitempty"`  // a gomod-compatible spec for the module
-	Path   string `mapstructure:"path,omitempty"`   // an optional path to the local version of this module
+	Name          string         `mapstructure:"name,omitempty"`           // if not specified, this is package part of the go mod (last part of the path)
+	Import        string         `mapstructure:"import,omitempty"`         // if not specified, this is the path part of the go mods
+	GoMod         string         `mapstructure:"gomod,omitempty"`          // a gomod-compatible spec for the module
+	Path          string         `mapstructure:"path,omitempty"`           // an optional path to the local version of this module
+	SourceArchive *SourceArchive `mapstructure:"source_archive,omitempty"` // an optional remote source archive that is downloaded, verified and used as the module's replace target
+
+	// fromSourceArchive marks modules whose Path was resolved from a SourceArchive.
+	// Such paths always remain absolute (they live in a machine-local cache).
+	fromSourceArchive bool `mapstructure:"-"`
+}
+
+// SourceArchive describes a remote source archive that OCB downloads, verifies,
+// extracts, and uses as the module's replace target. This is intended for
+// components whose VCS contents do not compile because generated code is not
+// committed and is instead published as a release asset.
+type SourceArchive struct {
+	URL       string `mapstructure:"url,omitempty"`        // the URL of the source archive (https or file scheme)
+	SHA256    string `mapstructure:"sha256,omitempty"`     // the expected hex-encoded sha256 digest of the archive
+	SHA256URL string `mapstructure:"sha256_url,omitempty"` // a URL to a SHA256SUMS-style file from which to resolve the digest
+	Subdir    string `mapstructure:"subdir,omitempty"`     // an optional subdirectory within the archive where the module's go.mod lives
 }
 
 type retry struct {
@@ -169,6 +200,12 @@ func (c *Config) SetGoPath() error {
 
 // ParseModules will parse the Modules entries and populate the missing values
 func (c *Config) ParseModules() error {
+	// Resolve any declared source archives before path handling, so that the
+	// downloaded/extracted location can be used as the module's replace target.
+	if err := c.resolveSourceArchives(); err != nil {
+		return err
+	}
+
 	var err error
 	usedNames := make(map[string]int)
 
@@ -223,6 +260,61 @@ func validateModules(name string, mods []Module) error {
 		if mod.GoMod == "" {
 			return fmt.Errorf("%s module at index %v: %w", name, i, errMissingGoMod)
 		}
+		if err := validateSourceArchive(mod); err != nil {
+			return fmt.Errorf("%s module at index %v: %w", name, i, err)
+		}
+	}
+	return nil
+}
+
+// validateSourceArchive checks the source_archive block of a module, if present.
+func validateSourceArchive(mod Module) error {
+	if mod.SourceArchive == nil {
+		return nil
+	}
+	sa := mod.SourceArchive
+	if mod.Path != "" {
+		return errors.New("source_archive and path cannot both be set on the same module")
+	}
+	if sa.URL == "" {
+		return errors.New("source_archive requires url")
+	}
+	if err := validateArchiveURLScheme("url", sa.URL); err != nil {
+		return err
+	}
+
+	switch {
+	case sa.SHA256 != "" && sa.SHA256URL != "":
+		return errors.New("source_archive: exactly one of sha256 or sha256_url must be set, not both")
+	case sa.SHA256 == "" && sa.SHA256URL == "":
+		return errors.New("source_archive: exactly one of sha256 or sha256_url must be set")
+	}
+
+	if sa.SHA256 != "" {
+		if len(sa.SHA256) != 64 {
+			return fmt.Errorf("source_archive: sha256 must be 64 hex characters, got %d", len(sa.SHA256))
+		}
+		if _, err := hex.DecodeString(sa.SHA256); err != nil {
+			return fmt.Errorf("source_archive: sha256 is not valid hex: %w", err)
+		}
+	}
+
+	if sa.SHA256URL != "" {
+		if err := validateArchiveURLScheme("sha256_url", sa.SHA256URL); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func validateArchiveURLScheme(field, raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("source_archive: %s is not a valid URL: %w", field, err)
+	}
+	if u.Scheme != "https" && u.Scheme != "file" {
+		return fmt.Errorf("source_archive: %s scheme must be https or file, got %q", field, u.Scheme)
 	}
 	return nil
 }
@@ -281,7 +373,9 @@ func (c *Config) parseModules(mods []Module, usedNames map[string]int) ([]Module
 				return mods, fmt.Errorf("failed to resolve absolute path for %s: %w", mod.Path, err)
 			}
 
-			if c.Distribution.UseAbsoluteReplacePaths {
+			if c.Distribution.UseAbsoluteReplacePaths || mod.fromSourceArchive {
+				// Archive-derived paths live in a machine-local cache; relative
+				// paths across volumes are fragile, so always keep them absolute.
 				mod.Path = absPath
 			} else {
 				absOutputPath, err := filepath.Abs(c.Distribution.OutputPath)

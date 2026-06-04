@@ -629,3 +629,113 @@ func TestMarshalYAML(t *testing.T) {
 	assert.NotContains(t, m, "conf_resolver")
 	assert.NotContains(t, m, "telemetry")
 }
+
+func TestValidateSourceArchive(t *testing.T) {
+	const validHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+	tests := []struct {
+		name    string
+		mod     Module
+		wantErr string
+	}{
+		{
+			name: "valid inline sha256",
+			mod: Module{
+				GoMod:         "go.opentelemetry.io/obi v0.9.0",
+				SourceArchive: &SourceArchive{URL: "https://example.com/a.tar.gz", SHA256: validHash},
+			},
+		},
+		{
+			name: "valid sha256_url",
+			mod: Module{
+				GoMod:         "go.opentelemetry.io/obi v0.9.0",
+				SourceArchive: &SourceArchive{URL: "https://example.com/a.tar.gz", SHA256URL: "https://example.com/SHA256SUMS"},
+			},
+		},
+		{
+			name: "valid file scheme",
+			mod: Module{
+				GoMod:         "go.opentelemetry.io/obi v0.9.0",
+				SourceArchive: &SourceArchive{URL: "file:///tmp/a.tar.gz", SHA256: validHash},
+			},
+		},
+		{
+			name: "missing url",
+			mod: Module{
+				GoMod:         "go.opentelemetry.io/obi v0.9.0",
+				SourceArchive: &SourceArchive{SHA256: validHash},
+			},
+			wantErr: "requires url",
+		},
+		{
+			name: "missing checksum",
+			mod: Module{
+				GoMod:         "go.opentelemetry.io/obi v0.9.0",
+				SourceArchive: &SourceArchive{URL: "https://example.com/a.tar.gz"},
+			},
+			wantErr: "exactly one of sha256 or sha256_url must be set",
+		},
+		{
+			name: "both checksums",
+			mod: Module{
+				GoMod:         "go.opentelemetry.io/obi v0.9.0",
+				SourceArchive: &SourceArchive{URL: "https://example.com/a.tar.gz", SHA256: validHash, SHA256URL: "https://example.com/SHA256SUMS"},
+			},
+			wantErr: "not both",
+		},
+		{
+			name: "bad url scheme",
+			mod: Module{
+				GoMod:         "go.opentelemetry.io/obi v0.9.0",
+				SourceArchive: &SourceArchive{URL: "ftp://example.com/a.tar.gz", SHA256: validHash},
+			},
+			wantErr: "scheme must be https or file",
+		},
+		{
+			name: "bad sha256_url scheme",
+			mod: Module{
+				GoMod:         "go.opentelemetry.io/obi v0.9.0",
+				SourceArchive: &SourceArchive{URL: "https://example.com/a.tar.gz", SHA256URL: "http://example.com/SHA256SUMS"},
+			},
+			wantErr: "sha256_url scheme must be https or file",
+		},
+		{
+			name: "path and source_archive conflict",
+			mod: Module{
+				GoMod:         "go.opentelemetry.io/obi v0.9.0",
+				Path:          "./local",
+				SourceArchive: &SourceArchive{URL: "https://example.com/a.tar.gz", SHA256: validHash},
+			},
+			wantErr: "source_archive and path cannot both be set",
+		},
+		{
+			name: "bad hex length",
+			mod: Module{
+				GoMod:         "go.opentelemetry.io/obi v0.9.0",
+				SourceArchive: &SourceArchive{URL: "https://example.com/a.tar.gz", SHA256: "abcd"},
+			},
+			wantErr: "must be 64 hex characters",
+		},
+		{
+			name: "not hex",
+			mod: Module{
+				GoMod:         "go.opentelemetry.io/obi v0.9.0",
+				SourceArchive: &SourceArchive{URL: "https://example.com/a.tar.gz", SHA256: "zz" + validHash[2:]},
+			},
+			wantErr: "not valid hex",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{Logger: zap.NewNop(), Receivers: []Module{tt.mod}}
+			err := cfg.Validate()
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+}

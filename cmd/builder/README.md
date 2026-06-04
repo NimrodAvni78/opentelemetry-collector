@@ -174,6 +174,42 @@ replaces:
   - github.com/open-telemetry/opentelemetry-collector-contrib/internal/common => github.com/open-telemetry/opentelemetry-collector-contrib/internal/common v0.128.0
 ```
 
+### Source archives
+
+Some components cannot be built directly from their version control contents because
+generated code is not committed and is instead published as a release asset. For these
+components, a module may declare a `source_archive` block. The builder downloads the
+archive, verifies its checksum, extracts it into a local cache, and uses the extracted
+directory as the module's `replace` target.
+
+```yaml
+receivers:
+  - gomod: go.opentelemetry.io/obi v0.9.0
+    import: go.opentelemetry.io/obi/collector
+    source_archive:
+      # The URL of the archive to download. Required. Must use the https or file scheme.
+      url: https://github.com/open-telemetry/opentelemetry-ebpf-instrumentation/releases/download/v0.9.0/obi-v0.9.0-source-generated.tar.gz
+      # The expected hex-encoded sha256 digest of the archive. Exactly one of
+      # sha256 or sha256_url is required.
+      sha256: "<hex digest>"
+      # Alternatively, a URL to a SHA256SUMS-style file from which to resolve the
+      # digest, matching on the archive's base file name.
+      # sha256_url: https://github.com/open-telemetry/opentelemetry-ebpf-instrumentation/releases/download/v0.9.0/SHA256SUMS
+      # An optional subdirectory within the archive where the module's go.mod lives. Optional.
+      # subdir: collector
+```
+
+Supported archive formats are `.tar.gz`/`.tgz` and `.zip`. The `source_archive` and `path`
+fields are mutually exclusive on the same module. If the extracted archive contains a single
+top-level directory and no top-level `go.mod`, the builder descends into it automatically.
+The `go.mod` at the resolved location must declare a `module` path equal to the module in
+`gomod`, guarding against accidentally pointing at the wrong artifact.
+
+Archives are cached under `os.UserCacheDir()/otelcol-builder/source_archive/<sha256>`. The
+cache root can be overridden with the `--download-cache-dir` flag or the top-level
+`download_cache_dir` configuration field. A cached archive is reused without any network
+access on subsequent builds.
+
 The builder also allows setting the scheme to use as the default URI scheme via `conf_resolver.default_uri_scheme`:
 
 ```yaml
