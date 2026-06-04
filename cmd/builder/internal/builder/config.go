@@ -26,8 +26,8 @@ const (
 	DefaultStableOtelColVersion = "v1.59.0"
 )
 
-// errMissingGoMod indicates an empty gomod field
-var errMissingGoMod = errors.New("missing gomod specification for module")
+// errMissingGoMod indicates a module that specifies neither gomod nor source_archive.
+var errMissingGoMod = errors.New("module requires either a gomod specification or a source_archive")
 
 // Config holds the builder's configuration
 type Config struct {
@@ -97,20 +97,30 @@ type Distribution struct {
 // Module represents a receiver, exporter, processor or extension for the distribution
 type Module struct {
 	Name          string         `mapstructure:"name,omitempty"`           // if not specified, this is package part of the go mod (last part of the path)
-	Import        string         `mapstructure:"import,omitempty"`         // if not specified, this is the path part of the go mods
-	GoMod         string         `mapstructure:"gomod,omitempty"`          // a gomod-compatible spec for the module
+	Import        string         `mapstructure:"import,omitempty"`         // if not specified, this is the path part of the go mods; mandatory for source_archive modules
+	GoMod         string         `mapstructure:"gomod,omitempty"`          // a gomod-compatible spec for the module; mutually exclusive with source_archive
 	Path          string         `mapstructure:"path,omitempty"`           // an optional path to the local version of this module
-	SourceArchive *SourceArchive `mapstructure:"source_archive,omitempty"` // an optional remote source archive that is downloaded, verified and used as the module's replace target
+	SourceArchive *SourceArchive `mapstructure:"source_archive,omitempty"` // a standalone module source: a remote archive that is downloaded, verified and used as the module's replace target; mutually exclusive with gomod
 
 	// fromSourceArchive marks modules whose Path was resolved from a SourceArchive.
 	// Such paths always remain absolute (they live in a machine-local cache).
 	fromSourceArchive bool `mapstructure:"-"`
 }
 
+// IsFromSourceArchive reports whether this module's replace target was resolved
+// from a source_archive. It is exported for use in the go.mod template, which
+// emits the require/replace directives for archive modules once (deduplicated)
+// rather than per component, since several components may share one archive.
+func (m Module) IsFromSourceArchive() bool {
+	return m.fromSourceArchive
+}
+
 // SourceArchive describes a remote source archive that OCB downloads, verifies,
-// extracts, and uses as the module's replace target. This is intended for
-// components whose VCS contents do not compile because generated code is not
-// committed and is instead published as a release asset.
+// extracts, and uses as the module's source. It is a standalone module source,
+// mutually exclusive with gomod: the module is built entirely from the artifact,
+// whose go.mod provides the module path and whose bytes are pinned by sha256.
+// This is intended for components whose VCS contents do not compile because
+// generated code is not committed and is instead published as a release asset.
 type SourceArchive struct {
 	URL       string `mapstructure:"url,omitempty"`        // the URL of the source archive (https or file scheme)
 	SHA256    string `mapstructure:"sha256,omitempty"`     // the expected hex-encoded sha256 digest of the archive
@@ -205,6 +215,9 @@ func (c *Config) ParseModules() error {
 	if err := c.resolveSourceArchives(); err != nil {
 		return err
 	}
+	if err := c.checkSourceArchiveConflicts(); err != nil {
+		return err
+	}
 
 	var err error
 	usedNames := make(map[string]int)
@@ -255,16 +268,69 @@ func (c *Config) allComponents() []Module {
 	return slices.Concat(c.Exporters, c.Receivers, c.Processors, c.Extensions, c.Connectors, []Module{c.Telemetry}, c.ConfmapProviders, c.ConfmapConverters)
 }
 
+// SourceArchiveModules returns one representative module per distinct
+// source-archive module path, in first-seen order. Several components may be
+// built from the same archive (e.g. a receiver and an extension from one
+// artifact); they share a module path and replace target, so the generated
+// go.mod must emit a single require and a single replace for them. It is
+// exported for use by the go.mod template.
+func (c *Config) SourceArchiveModules() []Module {
+	seen := make(map[string]struct{})
+	var out []Module
+	for _, mod := range c.allComponents() {
+		if !mod.fromSourceArchive {
+			continue
+		}
+		modulePath, _, _ := strings.Cut(mod.GoMod, " ")
+		if _, ok := seen[modulePath]; ok {
+			continue
+		}
+		seen[modulePath] = struct{}{}
+		out = append(out, mod)
+	}
+	return out
+}
+
+// checkSourceArchiveConflicts verifies that every component sharing a
+// source-archive module path also shares the same replace target. Two archives
+// claiming the same module path with different contents cannot both be replaced.
+func (c *Config) checkSourceArchiveConflicts() error {
+	paths := make(map[string]string) // module path -> replace target
+	for _, mod := range c.allComponents() {
+		if !mod.fromSourceArchive {
+			continue
+		}
+		modulePath, _, _ := strings.Cut(mod.GoMod, " ")
+		if existing, ok := paths[modulePath]; ok {
+			if existing != mod.Path {
+				return fmt.Errorf("source_archive module %q is provided by two different archives (%q and %q); a module path can only be replaced once", modulePath, existing, mod.Path)
+			}
+			continue
+		}
+		paths[modulePath] = mod.Path
+	}
+	return nil
+}
+
 func validateModules(name string, mods []Module) error {
 	for i, mod := range mods {
-		if mod.GoMod == "" {
-			return fmt.Errorf("%s module at index %v: %w", name, i, errMissingGoMod)
-		}
-		if err := validateSourceArchive(mod); err != nil {
+		if err := validateModuleSource(mod); err != nil {
 			return fmt.Errorf("%s module at index %v: %w", name, i, err)
 		}
 	}
 	return nil
+}
+
+// validateModuleSource enforces that a module declares exactly one source
+// (gomod or source_archive) and validates the source_archive block if present.
+func validateModuleSource(mod Module) error {
+	switch {
+	case mod.GoMod != "" && mod.SourceArchive != nil:
+		return errors.New("gomod and source_archive are mutually exclusive")
+	case mod.GoMod == "" && mod.SourceArchive == nil:
+		return errMissingGoMod
+	}
+	return validateSourceArchive(mod)
 }
 
 // validateSourceArchive checks the source_archive block of a module, if present.
@@ -275,6 +341,11 @@ func validateSourceArchive(mod Module) error {
 	sa := mod.SourceArchive
 	if mod.Path != "" {
 		return errors.New("source_archive and path cannot both be set on the same module")
+	}
+	// A source_archive module has no gomod to default the import from, and the
+	// import is what selects the package built out of the archive's module tree.
+	if mod.Import == "" {
+		return errors.New("source_archive requires import to be set (the package to build from the archive)")
 	}
 	if sa.URL == "" {
 		return errors.New("source_archive requires url")
@@ -326,12 +397,20 @@ func validateTelemetry(c *Config) error {
 	// would get a blend of this value and user-provided values. Once
 	// otelconftelemetry is its own module (that is, the `Import` field is not
 	// set), we can likely move the default to createDefaultConfig.
-	if c.Telemetry.Name == "" && c.Telemetry.Import == "" && c.Telemetry.GoMod == "" && c.Telemetry.Path == "" {
+	if c.Telemetry.Name == "" && c.Telemetry.Import == "" && c.Telemetry.GoMod == "" && c.Telemetry.Path == "" && c.Telemetry.SourceArchive == nil {
 		c.Telemetry = Module{
 			GoMod:  "go.opentelemetry.io/collector/service " + DefaultBetaOtelColVersion,
 			Import: "go.opentelemetry.io/collector/service/telemetry/otelconftelemetry",
 		}
-	} else if c.Telemetry.GoMod == "" {
+		return nil
+	}
+	// The telemetry module must be a plain gomod reference: nothing imports it by
+	// the manifest's component-import machinery, so a source_archive on telemetry
+	// has no supported wiring. Reject it (and a missing gomod) explicitly.
+	if c.Telemetry.SourceArchive != nil {
+		return errors.New("telemetry module: source_archive is not supported for the telemetry module; use gomod")
+	}
+	if c.Telemetry.GoMod == "" {
 		return fmt.Errorf("telemetry module: %w", errMissingGoMod)
 	}
 

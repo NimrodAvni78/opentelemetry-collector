@@ -68,10 +68,19 @@ func (c *Config) resolveSourceArchives() error {
 	return nil
 }
 
-// resolveSourceArchive resolves a single module's source archive in place.
+// sourceArchiveVersion is the synthetic require version used for modules sourced
+// from an archive. The artifact itself is the version (pinned by sha256), so the
+// manifest never asserts a Go module version. Under a directory replace the
+// require version is never resolved against a proxy, but it must be valid semver;
+// a -sourcearchive prerelease makes the synthetic origin obvious in the go.mod.
+const sourceArchiveVersion = "v0.0.0-sourcearchive"
+
+// resolveSourceArchive resolves a single module's source archive in place. The
+// module path is taken from the archive's go.mod (the artifact is the source of
+// truth); the module's GoMod is then synthesized so the existing replace/require
+// template machinery works unchanged.
 func (c *Config) resolveSourceArchive(mod *Module) error {
 	sa := mod.SourceArchive
-	modulePath, _, _ := strings.Cut(mod.GoMod, " ")
 
 	wantHash, err := c.resolveExpectedHash(sa)
 	if err != nil {
@@ -84,14 +93,54 @@ func (c *Config) resolveSourceArchive(mod *Module) error {
 	}
 	cacheDir := filepath.Join(cacheRoot, wantHash)
 
-	effectiveRoot, err := c.ensureExtracted(cacheRoot, cacheDir, sa, wantHash, modulePath)
+	effectiveRoot, modulePath, err := c.ensureExtracted(cacheRoot, cacheDir, sa, wantHash)
 	if err != nil {
 		return fmt.Errorf("source_archive %q: %w", sa.URL, err)
 	}
 
-	c.Logger.Info("Resolved source archive", zap.String("module", modulePath), zap.String("path", effectiveRoot))
+	// Validate that the configured import is actually built from this archive.
+	// These checks depend on mod.Import, which can differ between runs even for a
+	// cache hit, so they run on both the fresh-extract and cache-hit paths.
+	if err := validateArchiveImport(mod.Import, modulePath, effectiveRoot); err != nil {
+		return fmt.Errorf("source_archive %q: %w", sa.URL, err)
+	}
+
+	c.Logger.Info("Resolved source archive", zap.String("module", modulePath), zap.String("import", mod.Import), zap.String("path", effectiveRoot))
 	mod.Path = effectiveRoot
+	// Synthesize the module reference so go.mod.tmpl (require + replace) and
+	// everything downstream treats this like any other path-replaced module.
+	mod.GoMod = modulePath + " " + sourceArchiveVersion
 	mod.fromSourceArchive = true
+	return nil
+}
+
+// validateArchiveImport verifies that mod.Import is within the module provided by
+// the archive and that no nested module shadows the import path.
+func validateArchiveImport(importPath, modulePath, effectiveRoot string) error {
+	if importPath != modulePath && !strings.HasPrefix(importPath, modulePath+"/") {
+		return fmt.Errorf("import %q is not within module %q provided by the archive — the component would not be built from the archive", importPath, modulePath)
+	}
+
+	// Detect nested-module shadowing: if a directory along the import's relative
+	// path under the module root carries its own go.mod, that nested module (a
+	// longer module-path prefix of the import) would own the import, and the
+	// replace targeting the outer module root would not cover it. Walk only the
+	// directories between the root (exclusive) and the import subpackage.
+	rel := strings.TrimPrefix(importPath, modulePath)
+	rel = strings.TrimPrefix(rel, "/")
+	if rel == "" {
+		return nil
+	}
+	segments := strings.Split(rel, "/")
+	dir := effectiveRoot
+	for _, seg := range segments {
+		dir = filepath.Join(dir, seg)
+		if fileExists(filepath.Join(dir, "go.mod")) {
+			nested := modulePath + "/" + strings.TrimPrefix(strings.TrimPrefix(dir, effectiveRoot), string(filepath.Separator))
+			nested = filepath.ToSlash(nested)
+			return fmt.Errorf("import %q is shadowed by nested module %q in the archive — its replace would not cover the import", importPath, nested)
+		}
+	}
 	return nil
 }
 
@@ -139,27 +188,29 @@ func (c *Config) resolveExpectedHash(sa *SourceArchive) (string, error) {
 }
 
 // ensureExtracted ensures cacheDir contains the verified, extracted archive and
-// returns the effective module root within it. Network is skipped when the
-// cache directory already exists with a completion marker.
-func (c *Config) ensureExtracted(cacheRoot, cacheDir string, sa *SourceArchive, wantHash, modulePath string) (string, error) {
+// returns the effective module root within it together with the module path read
+// from the archive's go.mod. Network is skipped when the cache directory already
+// exists with a completion marker; the module path is re-derived from the cached
+// tree (cheap) so import validation still runs on cache hits.
+func (c *Config) ensureExtracted(cacheRoot, cacheDir string, sa *SourceArchive, wantHash string) (string, string, error) {
 	if marker := filepath.Join(cacheDir, completeMarker); fileExists(marker) {
 		c.Logger.Info("Using cached source archive", zap.String("path", cacheDir))
-		return c.effectiveRoot(cacheDir, sa, modulePath)
+		return c.effectiveRoot(cacheDir, sa)
 	}
 
 	if err := os.MkdirAll(cacheRoot, 0o750); err != nil {
-		return "", fmt.Errorf("failed to create cache root: %w", err)
+		return "", "", fmt.Errorf("failed to create cache root: %w", err)
 	}
 
 	archivePath, err := c.downloadArchive(cacheRoot, sa, wantHash)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	defer os.Remove(archivePath)
 
 	tmpDir, err := os.MkdirTemp(cacheRoot, "extract-")
 	if err != nil {
-		return "", fmt.Errorf("failed to create temp extraction dir: %w", err)
+		return "", "", fmt.Errorf("failed to create temp extraction dir: %w", err)
 	}
 	// On any error, clean up the partial extraction.
 	committed := false
@@ -170,35 +221,37 @@ func (c *Config) ensureExtracted(cacheRoot, cacheDir string, sa *SourceArchive, 
 	}()
 
 	if err := extractArchive(archivePath, sa.URL, tmpDir); err != nil {
-		return "", err
+		return "", "", err
 	}
 
-	if _, err := c.effectiveRoot(tmpDir, sa, modulePath); err != nil {
-		return "", err
+	if _, _, err := c.effectiveRoot(tmpDir, sa); err != nil {
+		return "", "", err
 	}
 
 	// Mark complete then atomically move into place.
 	if err := os.WriteFile(filepath.Join(tmpDir, completeMarker), nil, 0o600); err != nil {
-		return "", fmt.Errorf("failed to write completion marker: %w", err)
+		return "", "", fmt.Errorf("failed to write completion marker: %w", err)
 	}
 	if err := os.Rename(tmpDir, cacheDir); err != nil {
 		// Lost-race case: another process already populated the cache dir.
 		if fileExists(filepath.Join(cacheDir, completeMarker)) {
 			os.RemoveAll(tmpDir)
 			committed = true
-			return c.effectiveRoot(cacheDir, sa, modulePath)
+			return c.effectiveRoot(cacheDir, sa)
 		}
-		return "", fmt.Errorf("failed to move extracted archive into cache: %w", err)
+		return "", "", fmt.Errorf("failed to move extracted archive into cache: %w", err)
 	}
 	committed = true
 
-	return c.effectiveRoot(cacheDir, sa, modulePath)
+	return c.effectiveRoot(cacheDir, sa)
 }
 
 // effectiveRoot resolves the module root within an extracted tree: it auto-strips
 // a single top-level directory (when there is no top-level go.mod), applies any
-// configured subdir, and validates the go.mod module path.
-func (c *Config) effectiveRoot(root string, sa *SourceArchive, modulePath string) (string, error) {
+// configured subdir, and reads the module path from the resolved go.mod, which is
+// the source of truth for a source_archive module. It returns the resolved root
+// and the module path.
+func (c *Config) effectiveRoot(root string, sa *SourceArchive) (string, string, error) {
 	effective := root
 
 	// Auto-strip: if the root has exactly one directory, no go.mod and no other
@@ -206,7 +259,7 @@ func (c *Config) effectiveRoot(root string, sa *SourceArchive, modulePath string
 	if !fileExists(filepath.Join(effective, "go.mod")) {
 		entries, err := os.ReadDir(effective)
 		if err != nil {
-			return "", fmt.Errorf("failed to read extracted root: %w", err)
+			return "", "", fmt.Errorf("failed to read extracted root: %w", err)
 		}
 		var dirs []string
 		extraFiles := false
@@ -228,13 +281,13 @@ func (c *Config) effectiveRoot(root string, sa *SourceArchive, modulePath string
 	if sa.Subdir != "" {
 		cleaned := filepath.Clean(sa.Subdir)
 		if filepath.IsAbs(cleaned) || cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
-			return "", fmt.Errorf("subdir %q escapes the archive tree", sa.Subdir)
+			return "", "", fmt.Errorf("subdir %q escapes the archive tree", sa.Subdir)
 		}
 		candidate := filepath.Join(effective, cleaned)
 		// Verify the candidate stays within effective after cleaning.
 		rel, err := filepath.Rel(effective, candidate)
 		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return "", fmt.Errorf("subdir %q escapes the archive tree", sa.Subdir)
+			return "", "", fmt.Errorf("subdir %q escapes the archive tree", sa.Subdir)
 		}
 		effective = candidate
 	}
@@ -242,20 +295,17 @@ func (c *Config) effectiveRoot(root string, sa *SourceArchive, modulePath string
 	goModPath := filepath.Join(effective, "go.mod")
 	data, err := os.ReadFile(filepath.Clean(goModPath))
 	if err != nil {
-		return "", fmt.Errorf("expected go.mod at %q: %w", goModPath, err)
+		return "", "", fmt.Errorf("expected go.mod at %q: %w", goModPath, err)
 	}
 	parsed, err := modfile.Parse(goModPath, data, nil)
 	if err != nil {
-		return "", fmt.Errorf("failed to parse go.mod at %q: %w", goModPath, err)
+		return "", "", fmt.Errorf("failed to parse go.mod at %q: %w", goModPath, err)
 	}
 	if parsed.Module == nil {
-		return "", fmt.Errorf("go.mod at %q has no module path", goModPath)
-	}
-	if parsed.Module.Mod.Path != modulePath {
-		return "", fmt.Errorf("source archive module path %q does not match configured gomod module %q (wrong artifact?)", parsed.Module.Mod.Path, modulePath)
+		return "", "", fmt.Errorf("go.mod at %q has no module path", goModPath)
 	}
 
-	return effective, nil
+	return effective, parsed.Module.Mod.Path, nil
 }
 
 // downloadArchive downloads the archive to a temp file in cacheRoot, verifying
